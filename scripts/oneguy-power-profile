@@ -1,0 +1,191 @@
+#!/usr/bin/env python3
+"""
+OneGuyOS Power Profile & Dynamic RAPL Governor CLI
+Controls Intel RAPL package limits (PL1/PL2) and Energy Performance Bias (EPB).
+Modes:
+  - ac: Uncapped high performance (PL1=54W, PL2=64W, EPB=0)
+  - battery: Ultra-cool silent longevity (PL1=15W, PL2=25W, EPB=6)
+  - stock: Dell factory baseline (PL1=40W, PL2=60W, EPB=6)
+  - auto: Detect AC/Battery state and apply optimal profile
+  - status: Display active power envelope, limits, and real-time wattage
+"""
+
+import os
+import sys
+import glob
+import time
+
+PL1_PATH = "/sys/class/powercap/intel-rapl/intel-rapl:0/constraint_0_power_limit_uw"
+PL2_PATH = "/sys/class/powercap/intel-rapl/intel-rapl:0/constraint_1_power_limit_uw"
+AC_PATH = "/sys/class/power_supply/AC/online"
+ENERGY_PATH = "/sys/class/powercap/intel-rapl/intel-rapl:0/energy_uj"
+
+PROFILES = {
+    "ac": {
+        "name": "AC Workstation Max Performance",
+        "pl1_w": 54.0,
+        "pl2_w": 64.0,
+        "epb": 0,
+        "epp": "balance_performance",
+    },
+    "battery": {
+        "name": "Battery Ultra-Cool Longevity",
+        "pl1_w": 15.0,
+        "pl2_w": 25.0,
+        "epb": 6,
+        "epp": "balance_power",
+    },
+    "stock": {
+        "name": "Dell Factory Stock Baseline",
+        "pl1_w": 40.0,
+        "pl2_w": 60.0,
+        "epb": 6,
+        "epp": "balance_performance",
+    }
+}
+
+def set_limits(pl1_w, pl2_w, epb, epp):
+    # Set RAPL
+    try:
+        with open(PL1_PATH, "w") as f:
+            f.write(str(int(pl1_w * 1_000_000)))
+        with open(PL2_PATH, "w") as f:
+            f.write(str(int(pl2_w * 1_000_000)))
+    except Exception as e:
+        print(f"[ERROR] Could not set RAPL: {e}")
+        return False
+
+    # Set EPB
+    for path in glob.glob("/sys/devices/system/cpu/cpu*/power/energy_perf_bias"):
+        try:
+            with open(path, "w") as f:
+                f.write(str(epb))
+        except:
+            pass
+
+    # Set EPP
+    for path in glob.glob("/sys/devices/system/cpu/cpufreq/policy*/energy_performance_preference"):
+        try:
+            with open(path, "w") as f:
+                f.write(epp)
+        except:
+            pass
+
+    return True
+
+def get_status():
+    status = {}
+    try:
+        with open(PL1_PATH) as f:
+            status["pl1_w"] = int(f.read().strip()) / 1_000_000.0
+        with open(PL2_PATH) as f:
+            status["pl2_w"] = int(f.read().strip()) / 1_000_000.0
+    except:
+        status["pl1_w"] = 0.0
+        status["pl2_w"] = 0.0
+
+    epb_paths = glob.glob("/sys/devices/system/cpu/cpu0/power/energy_perf_bias")
+    if epb_paths:
+        try:
+            with open(epb_paths[0]) as f:
+                status["epb"] = f.read().strip()
+        except:
+            status["epb"] = "N/A"
+    else:
+        status["epb"] = "N/A"
+
+    epp_paths = glob.glob("/sys/devices/system/cpu/cpufreq/policy0/energy_performance_preference")
+    if epp_paths:
+        try:
+            with open(epp_paths[0]) as f:
+                status["epp"] = f.read().strip()
+        except:
+            status["epp"] = "N/A"
+    else:
+        status["epp"] = "N/A"
+
+    if os.path.exists(AC_PATH):
+        try:
+            with open(AC_PATH) as f:
+                status["ac_online"] = (f.read().strip() == "1")
+        except:
+            status["ac_online"] = False
+    else:
+        status["ac_online"] = True
+
+    # Measure current power
+    if os.path.exists(ENERGY_PATH):
+        try:
+            with open(ENERGY_PATH) as f:
+                e1 = int(f.read().strip())
+            t1 = time.time()
+            time.sleep(0.3)
+            with open(ENERGY_PATH) as f:
+                e2 = int(f.read().strip())
+            t2 = time.time()
+            status["current_w"] = ((e2 - e1) / 1_000_000.0) / (t2 - t1)
+        except:
+            status["current_w"] = 0.0
+    else:
+        status["current_w"] = 0.0
+
+    temps = []
+    for z in glob.glob("/sys/class/thermal/thermal_zone*/temp"):
+        try:
+            with open(z) as f:
+                temps.append(int(f.read().strip()) / 1000.0)
+        except:
+            pass
+    status["temp_c"] = max(temps) if temps else 0.0
+
+    return status
+
+def apply_profile(profile_key):
+    if profile_key not in PROFILES:
+        print(f"Unknown profile: {profile_key}. Available: {list(PROFILES.keys())}")
+        sys.exit(1)
+    p = PROFILES[profile_key]
+    print(f"Applying Profile: {p['name']}...")
+    if set_limits(p["pl1_w"], p["pl2_w"], p["epb"], p["epp"]):
+        print(f"[✓] PL1={p['pl1_w']}W, PL2={p['pl2_w']}W, EPB={p['epb']}, EPP={p['epp']}")
+    else:
+        print("[!] Warning: Root privileges required (run with sudo).")
+        sys.exit(1)
+
+def auto_mode():
+    is_ac = True
+    if os.path.exists(AC_PATH):
+        with open(AC_PATH) as f:
+            is_ac = (f.read().strip() == "1")
+    if is_ac:
+        apply_profile("ac")
+    else:
+        apply_profile("battery")
+
+def print_status():
+    s = get_status()
+    print("==================================================")
+    print("          OneGuyOS Power & RAPL Status            ")
+    print("==================================================")
+    print(f" Power Source   : {'AC Adapter (Plugged In)' if s['ac_online'] else 'Battery (Discharging)'}")
+    print(f" RAPL PL1 Clamped: {s['pl1_w']:.1f} Watts (Sustained)")
+    print(f" RAPL PL2 Clamped: {s['pl2_w']:.1f} Watts (Burst)")
+    print(f" Intel EPB Floor: {s['epb']} (0=Max Performance, 6=Normal)")
+    print(f" Autonomous EPP : {s['epp']}")
+    print(f" Active Package : {s['current_w']:.2f} Watts")
+    print(f" Thermal Peak   : {s['temp_c']:.1f} °C")
+    print("==================================================")
+
+def main():
+    if len(sys.argv) < 2 or sys.argv[1] in ["status", "--status", "-s"]:
+        print_status()
+    elif sys.argv[1] == "auto":
+        auto_mode()
+    elif sys.argv[1] in PROFILES:
+        apply_profile(sys.argv[1])
+    else:
+        print("Usage: oneguy-power-profile [status|ac|battery|stock|auto]")
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()
